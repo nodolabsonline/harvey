@@ -9,6 +9,12 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Dashboard behind a reverse proxy.** `HARVEY_DASHBOARD_BIND`,
+  `HARVEY_DASHBOARD_ALLOWED_HOSTS` and `HARVEY_DASHBOARD_ALLOWED_ORIGINS`
+  can publish the dashboard on a non-loopback address and an `https://`
+  origin. Unset, it still binds to `127.0.0.1` and accepts only loopback
+  hosts and the matching `http://` origin. `*` is refused. The bearer token
+  stays required, and `X-Forwarded-*` is not trusted.
 - **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
   listings around each city, with phone, website, category, rating and review
   count, and Google organic results with rank, both from one
