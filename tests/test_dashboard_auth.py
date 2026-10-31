@@ -5,7 +5,8 @@ PID/log files are all redirected into tmp_path, and starting Harvey is
 stubbed. Covers: every route needs the token (enumerated, so a new route
 can't slip through), the public shell carries no data, Host/Origin/fetch
 metadata checks, cross-site "simple" requests, token storage, .env
-persistence, loopback-only binding, a real server started as the CLI does,
+persistence, loopback-only binding unless the proxy env is set, a real server
+started as the CLI does,
 and the browser-side token handling under node.
 """
 
@@ -53,6 +54,11 @@ def env(tmp_path, monkeypatch):
             raise AssertionError("Harvey must not be started by this request")
 
     monkeypatch.setattr(dash.subprocess, "Popen", NoPopen)
+    # The proxy knobs must not leak in from the developer environment.
+    for name in ("HARVEY_DASHBOARD_BIND", "HARVEY_DASHBOARD_ALLOWED_HOSTS",
+                 "HARVEY_DASHBOARD_ALLOWED_ORIGINS"):
+        monkeypatch.delenv(name, raising=False)
+    auth.set_proxy_file_values({})
     return {"dir": tmp_path, "spawned": spawned, "token": dash.token_store.get()}
 
 
@@ -740,9 +746,13 @@ def test_real_server_started_like_the_cli(tmp_path):
     script = tmp_path / "start.py"
     script.write_text(START)
     root = Path(dash.__file__).resolve().parent.parent
+    child_env = {**os.environ, "PYTHONPATH": str(root)}
+    for name in ("HARVEY_DASHBOARD_BIND", "HARVEY_DASHBOARD_ALLOWED_HOSTS",
+                 "HARVEY_DASHBOARD_ALLOWED_ORIGINS"):
+        child_env.pop(name, None)
     proc = subprocess.Popen([sys.executable, "-u", str(script), str(tmp_path), str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            env={**os.environ, "PYTHONPATH": str(root)})
+                            env=child_env)
     try:
         base = f"http://127.0.0.1:{port}"
         for _ in range(200):
@@ -774,6 +784,171 @@ def test_real_server_started_like_the_cli(tmp_path):
     if os.name != "nt":
         assert stat.S_IMODE((tmp_path / ".env").stat().st_mode) == 0o600
         assert stat.S_IMODE((tmp_path / "data" / "dashboard-token").stat().st_mode) == 0o600
+
+
+# ── Reverse proxy: off unless the operator names a host and an origin ──
+
+
+def _clear_proxy_env(monkeypatch):
+    for name in ("HARVEY_DASHBOARD_BIND", "HARVEY_DASHBOARD_ALLOWED_HOSTS",
+                 "HARVEY_DASHBOARD_ALLOWED_ORIGINS"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_default_exposure_matches_loopback_only(env, monkeypatch):
+    """No proxy variables: non-local Host is 400, https Origin is 403, and
+    forwarded headers do not widen either check."""
+    _clear_proxy_env(monkeypatch)
+    token = env["token"]
+    bearer = {"Authorization": f"Bearer {token}"}
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        refused = c.get("/api/companies", headers={**bearer, "Host": "panel.example.com"})
+        assert refused.status_code == 400
+        assert refused.json()["error"] == "bad_host"
+        https = c.get("/api/companies", headers={
+            **bearer, "Origin": "https://127.0.0.1:5555", "X-Forwarded-Proto": "https"})
+        assert https.status_code == 403
+        assert https.json()["error"] == "cross_origin"
+        forwarded = c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com", "X-Forwarded-Host": "127.0.0.1:5555"})
+        assert forwarded.status_code == 400
+        assert c.get("/api/companies").status_code == 401
+        assert c.get("/api/companies", headers=bearer).status_code == 200
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start"))
+    with pytest.raises(dash.DashboardSetupError, match="only listens on this machine"):
+        dash.start_dashboard(host="0.0.0.0", port=5555)
+
+
+def test_env_allows_a_named_host_and_rejects_the_rest(env, monkeypatch):
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS",
+                       "panel.example.com, other.example.net:443")
+    token = env["token"]
+    bearer = {"Authorization": f"Bearer {token}"}
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        for host in ("panel.example.com", "panel.example.com:443", "OTHER.example.net"):
+            ok = c.get("/api/companies", headers={**bearer, "Host": host})
+            assert ok.status_code == 200, host
+        denied = c.get("/api/companies", headers={**bearer, "Host": "evil.example"})
+        assert denied.status_code == 400
+        assert denied.json()["error"] == "bad_host"
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "not-listed.example",
+            "X-Forwarded-Host": "panel.example.com"}).status_code == 400
+
+
+def test_env_allows_an_https_origin_only_when_listed(env, monkeypatch):
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "panel.example.com")
+    token = env["token"]
+    bearer = {"Authorization": f"Bearer {token}"}
+    listed = {
+        "Host": "panel.example.com",
+        "Origin": "https://panel.example.com",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        blocked = c.get("/api/companies", headers={**listed, **bearer})
+        assert blocked.status_code == 403
+        monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_ORIGINS",
+                           "https://panel.example.com, https://other.example.net")
+        ok = c.get("/api/companies", headers={**listed, **bearer})
+        assert ok.status_code == 200
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com",
+            "Origin": "https://Panel.Example.com/"}).status_code == 200
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com",
+            "Origin": "https://evil.example"}).status_code == 403
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com",
+            "Origin": "https://panel.example.com",
+            "Sec-Fetch-Site": "cross-site"}).status_code == 403
+        # https is never implied by the host list. The http origin that
+        # matches the Host header still follows the loopback rule.
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com",
+            "Origin": "http://panel.example.com"}).status_code == 200
+
+
+def test_bearer_stays_required_when_proxy_hosts_are_configured(env, monkeypatch):
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "panel.example.com")
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_ORIGINS", "https://panel.example.com")
+    headers = {"Host": "panel.example.com", "Origin": "https://panel.example.com"}
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        shell = c.get("/", headers=headers)
+        assert shell.status_code == 200 and env["token"] not in shell.text
+        missing = c.get("/api/companies", headers=headers)
+        assert missing.status_code == 401
+        assert missing.json()["error"] == "unauthorized"
+        assert missing.headers["www-authenticate"].startswith("Bearer")
+        wrong = c.get("/api/companies", headers={**headers, "Authorization": "Bearer nope"})
+        assert wrong.status_code == 401
+        query = c.get("/api/companies", params={"token": env["token"]}, headers=headers)
+        assert query.status_code == 401
+        ok = c.get("/api/companies", headers={
+            **headers, "Authorization": f"Bearer {env['token']}"})
+        assert ok.status_code == 200
+
+
+def test_wildcard_allowlists_do_not_open_the_dashboard(env, monkeypatch):
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: pytest.fail("must not start"))
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "*")
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_ORIGINS", "*")
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        assert c.get("/api/companies", headers={
+            "Host": "panel.example.com",
+            "Origin": "https://panel.example.com",
+            "Authorization": f"Bearer {env['token']}"}).status_code == 400
+        assert c.get("/api/companies", headers={
+            "Host": "127.0.0.1:5555",
+            "Origin": "https://evil.example",
+            "Authorization": f"Bearer {env['token']}"}).status_code == 403
+    with pytest.raises(dash.DashboardSetupError, match=r"\*"):
+        dash.start_dashboard(host="127.0.0.1", port=5555)
+    monkeypatch.setenv("HARVEY_DASHBOARD_BIND", "0.0.0.0")
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "panel.example.com")
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_ORIGINS", "https://*")
+    with pytest.raises(dash.DashboardSetupError, match=r"\*"):
+        dash.start_dashboard(host="127.0.0.1", port=5555)
+
+
+def test_bind_env_listens_only_with_an_allowed_host(env, monkeypatch, capsys):
+    import uvicorn
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **k: calls.append(k))
+    monkeypatch.setenv("HARVEY_DASHBOARD_BIND", "0.0.0.0")
+    with pytest.raises(dash.DashboardSetupError, match="HARVEY_DASHBOARD_ALLOWED_HOSTS"):
+        dash.start_dashboard(host="127.0.0.1", port=5555)
+    assert calls == []
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "panel.example.com")
+    monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_ORIGINS", "https://panel.example.com")
+    dash.start_dashboard(host="127.0.0.1", port=5555)
+    out = capsys.readouterr().out
+    assert calls[0]["host"] == "0.0.0.0"
+    assert calls[0]["proxy_headers"] is False
+    assert f"https://panel.example.com/#token={env['token']}" in out
+    assert "?token" not in out
+
+
+def test_env_file_names_a_host_until_the_process_overrides_it(env, monkeypatch):
+    dash.ENV_FILE.write_text(
+        "HARVEY_DASHBOARD_ALLOWED_HOSTS=panel.example.com\n"
+        "HARVEY_DASHBOARD_ALLOWED_ORIGINS=https://panel.example.com\n")
+    dash._hydrate_dashboard_env()
+    bearer = {"Authorization": f"Bearer {env['token']}"}
+    with TestClient(dash.app, base_url=ORIGIN) as c:
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com",
+            "Origin": "https://panel.example.com"}).status_code == 200
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "evil.example"}).status_code == 400
+        monkeypatch.setenv("HARVEY_DASHBOARD_ALLOWED_HOSTS", "other.example.net")
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "panel.example.com"}).status_code == 400
+        assert c.get("/api/companies", headers={
+            **bearer, "Host": "other.example.net",
+            "Origin": "https://panel.example.com"}).status_code == 200
 
 
 # ── The browser side (auth.js / app.js) under node ──

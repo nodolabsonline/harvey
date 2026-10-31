@@ -155,7 +155,9 @@ Docker Compose runs the dashboard; start and stop the heartbeat from its
 Actions card. Host networking preserves the dashboard's loopback-only bind at
 `127.0.0.1:5555`. This Compose setup supports native Linux; use the pip install
 above on macOS or Windows. On a remote Linux host, reach the dashboard through
-an SSH tunnel rather than exposing its port to the network.
+an SSH tunnel rather than exposing its port to the network. To serve it on
+an HTTPS hostname instead, see **Behind a reverse proxy** below. The
+variables are unset in this Compose file, so it still binds to loopback.
 
 ```bash
 git clone https://github.com/ethanplusai/harvey.git
@@ -514,6 +516,16 @@ harvey dashboard     # prints the link to open, e.g. http://127.0.0.1:5555/#toke
 **Opening it.** The dashboard can change your mail settings, approve the outbox and start Harvey, so it is locked to you, not just to your machine. On first start it creates a random token in `data/dashboard-token` (readable only by you) and prints a link carrying it after the `#`. Open that link: the page keeps the token for that browser tab only and removes it from the address bar. A new tab, or a tab opened without the link, shows a locked screen; paste the token there, or run `harvey dashboard --url` to print the link again. Every API request needs the token as an `Authorization: Bearer` header — scripts and `curl` included — and the token is never accepted from a cookie or a query string. Delete `data/dashboard-token` and restart the dashboard to replace it.
 
 **It only listens on this machine.** `--host` accepts loopback addresses only (`127.0.0.1`, `::1`, `localhost`), and requests must name one of them in their `Host` header, which also stops a DNS name pointed at 127.0.0.1 from reaching it. Requests sent by other websites open in your browser are refused. To use it from another computer, tunnel instead of exposing it: `ssh -L 5555:127.0.0.1:5555 your-machine`, then open the printed link locally. The token protects against other users and other websites, not against programs already running as your own user account, which can read the token file just as they can read `.env` or the database.
+
+**Behind a reverse proxy.** Leave the variables below unset and nothing here changes. A proxy that forwards the browser's own `Host` and `Origin` (Traefik does; Harvey does not read `X-Forwarded-Host` or `X-Forwarded-Proto`) can publish the dashboard when these are set in the dashboard process, or in `.env` when the process left them blank. A value already in the process environment wins. `*` is refused, not "any host".
+
+```
+HARVEY_DASHBOARD_BIND=0.0.0.0
+HARVEY_DASHBOARD_ALLOWED_HOSTS=panel.example.com
+HARVEY_DASHBOARD_ALLOWED_ORIGINS=https://panel.example.com
+```
+
+`BIND` is the listen address. `0.0.0.0` is what a proxy on another interface connects to, and Harvey refuses it until `ALLOWED_HOSTS` names at least one hostname. That list is extra `Host` values, added to `localhost` / `127.0.0.1` / `::1`; the port in the header is ignored. `ALLOWED_ORIGINS` is extra browser origins (`http://` or `https://`, no path), added to `http://` plus the `Host` header, so an `https://` page has to be listed exactly (browsers omit the default port). Restart the dashboard after changing them. Every API request still needs `Authorization: Bearer`. The HTML shell stays public, as it is on localhost.
 
 **Windows:** the token file is protected by the permissions of the folder it lives in (your user profile normally restricts this to you); Harvey doesn't apply POSIX file modes there.
 

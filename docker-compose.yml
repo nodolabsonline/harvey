@@ -6,6 +6,9 @@ services:
         HARVEY_UID: ${HARVEY_UID:-1000}
         HARVEY_GID: ${HARVEY_GID:-1000}
     # Supported on native Linux. Keep the dashboard's loopback-only bind.
+    # HARVEY_DASHBOARD_BIND, HARVEY_DASHBOARD_ALLOWED_HOSTS and
+    # HARVEY_DASHBOARD_ALLOWED_ORIGINS can publish it behind a proxy.
+    # This file leaves them unset, so the bind stays loopback.
     network_mode: host
     command: ["dashboard"]
     volumes:

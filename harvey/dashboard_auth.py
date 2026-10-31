@@ -6,13 +6,17 @@ still *send*), and any DNS name pointed at 127.0.0.1 can reach the port. So
 every request passes, in order:
 
 1. Host: one Host header naming a loopback address (``localhost``,
-   127.0.0.0/8, ``[::1]``) with an optional port. Anything else, including a
-   rebinding name that resolves to 127.0.0.1, is refused before the token is
-   looked at.
-2. Browser provenance: a request carrying ``Origin`` must come from exactly
-   this origin, and ``Sec-Fetch-Site`` must be ``same-origin`` or ``none``.
-   (A top-level navigation to ``/`` is the one exception: the shell carries
+   127.0.0.0/8, ``[::1]``) with an optional port, or a hostname listed in
+   ``HARVEY_DASHBOARD_ALLOWED_HOSTS``. Anything else, including a rebinding
+   name that resolves to 127.0.0.1, is refused before the token is looked
+   at. ``*`` is not a hostname.
+2. Browser provenance: a request carrying ``Origin`` must be exactly
+   ``http://`` plus that Host header, or an origin listed in
+   ``HARVEY_DASHBOARD_ALLOWED_ORIGINS`` (``http://`` or ``https://``, no
+   path). ``Sec-Fetch-Site`` must be ``same-origin`` or ``none``. (A
+   top-level navigation to ``/`` is the one exception: the shell carries
    no data.) No CORS headers are ever sent, so preflights fail.
+   ``X-Forwarded-Host`` and ``X-Forwarded-Proto`` are ignored.
 3. Public shell: only ``GET``/``HEAD`` of ``/`` and ``/static/*`` (HTML, CSS,
    JS, fonts; no data, no token) skip authentication.
 4. Bearer token: everything else needs ``Authorization: Bearer <token>``,
@@ -31,6 +35,10 @@ otherwise the API stays locked (fail closed) and the error says what to do.
 
 On Windows, POSIX permission bits mean nothing: the file gets whatever ACL
 the folder grants, and Harvey doesn't pretend otherwise (see README).
+
+``HARVEY_DASHBOARD_BIND`` is the listen address. Unset, the server binds to
+loopback. A non-loopback address is accepted only together with at least
+one allowed host. Neither switch turns the bearer check off.
 
 This does not protect against code already running as the same OS user,
 which can read the token file (or the database) directly.
@@ -53,6 +61,12 @@ from pathlib import Path
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
 _PORT_RE = re.compile(r":[0-9]{1,5}")
 _IS_WINDOWS = os.name == "nt"
+
+# Unset (or blank) keeps today's loopback-only dashboard. Names are exact:
+# a star is a configuration error, never "allow everything".
+BIND_ENV = "HARVEY_DASHBOARD_BIND"
+ALLOWED_HOSTS_ENV = "HARVEY_DASHBOARD_ALLOWED_HOSTS"
+ALLOWED_ORIGINS_ENV = "HARVEY_DASHBOARD_ALLOWED_ORIGINS"
 
 SECURITY_HEADERS = [
     (b"cache-control", b"no-store"),
@@ -274,6 +288,132 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+# Filled from .env at startup when the process environment left a key blank.
+# Process environment always wins over the file.
+_file_fallback: dict[str, str] = {}
+
+
+def set_proxy_file_values(values: dict[str, str]):
+    """Replace the .env fallback for the three proxy variables."""
+    _file_fallback.clear()
+    for key in (BIND_ENV, ALLOWED_HOSTS_ENV, ALLOWED_ORIGINS_ENV):
+        value = (values.get(key) or "").strip()
+        if value:
+            _file_fallback[key] = value
+
+
+def proxy_setting(name: str) -> str:
+    """Process environment, else the value loaded from .env, else blank."""
+    process = os.environ.get(name, "").strip()
+    if process:
+        return process
+    return _file_fallback.get(name, "").strip()
+
+
+def _csv_env(name: str) -> tuple[str, ...] | None:
+    """Comma-separated entries, or None when the variable is unset or blank."""
+    raw = proxy_setting(name)
+    if not raw:
+        return None
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return items or None
+
+
+def canonical_host_name(value: str) -> str | None:
+    """A hostname from an allow-list entry. The port is not part of the name."""
+    if not value or "*" in value or "://" in value or "/" in value or "@" in value:
+        return None
+    return parse_host(value)
+
+
+def canonical_origin(value: str) -> str | None:
+    """``http(s)://host[:port]`` with no path, user or wildcard."""
+    if not value or "*" in value or "@" in value or "\\" in value:
+        return None
+    text = value.strip().lower()
+    if text.endswith("/"):
+        text = text[:-1]
+    if text.startswith("https://"):
+        scheme, rest = "https", text[len("https://"):]
+    elif text.startswith("http://"):
+        scheme, rest = "http", text[len("http://"):]
+    else:
+        return None
+    if not rest or any(c in rest for c in "/?#"):
+        return None
+    if parse_host(rest) is None:
+        return None
+    return f"{scheme}://{rest}"
+
+
+def exposure_error() -> str | None:
+    """Why the proxy settings cannot be used, or None when they are empty or safe.
+
+    An illegal list fails closed: it does not widen who is accepted.
+    """
+    hosts = _csv_env(ALLOWED_HOSTS_ENV)
+    if hosts is not None:
+        for item in hosts:
+            if "*" in item:
+                return (f"{ALLOWED_HOSTS_ENV} must list hostnames separated by commas. "
+                        "'*' is not accepted.")
+            if canonical_host_name(item) is None:
+                return f"{ALLOWED_HOSTS_ENV} has an invalid host: {item!r}."
+    origins = _csv_env(ALLOWED_ORIGINS_ENV)
+    if origins is not None:
+        for item in origins:
+            if "*" in item:
+                return (f"{ALLOWED_ORIGINS_ENV} must list http:// or https:// origins "
+                        "separated by commas. '*' is not accepted.")
+            if canonical_origin(item) is None:
+                return f"{ALLOWED_ORIGINS_ENV} has an invalid origin: {item!r}."
+    return None
+
+
+def allowed_hosts() -> tuple[str, ...]:
+    """Extra Host names. Empty when unset or when the list is not safe."""
+    if exposure_error():
+        return ()
+    items = _csv_env(ALLOWED_HOSTS_ENV)
+    if not items:
+        return ()
+    names = []
+    for item in items:
+        name = canonical_host_name(item)
+        if name is None:
+            return ()
+        names.append(name)
+    return tuple(names)
+
+
+def allowed_origins() -> tuple[str, ...]:
+    """Extra browser origins. Empty when unset or when the list is not safe."""
+    if exposure_error():
+        return ()
+    items = _csv_env(ALLOWED_ORIGINS_ENV)
+    if not items:
+        return ()
+    origins = []
+    for item in items:
+        origin = canonical_origin(item)
+        if origin is None:
+            return ()
+        origins.append(origin)
+    return tuple(origins)
+
+
+def host_permitted(host: str) -> bool:
+    return is_loopback(host) or host in allowed_hosts()
+
+
+def origin_permitted(origin: str, host_header: str) -> bool:
+    """The loopback rule (``http://`` plus the Host header) plus a named list."""
+    if origin.lower() == f"http://{host_header}":
+        return True
+    canon = canonical_origin(origin)
+    return bool(canon) and canon in allowed_origins()
+
+
 def is_public_path(method: str, path: str) -> bool:
     if method not in ("GET", "HEAD"):
         return False
@@ -340,18 +480,19 @@ class DashboardGuard:
         # 1. Host, before anything else.
         hosts = headers.get("host", [])
         host = parse_host(hosts[0]) if len(hosts) == 1 else None
-        if host is None or not is_loopback(host):
+        if host is None or not host_permitted(host):
             return await deny(400, "bad_host",
                               "This dashboard only answers to localhost / 127.0.0.1.")
         host_header = hosts[0].lower()
 
-        # 2. Browser provenance.
+        # 2. Browser provenance. Forwarded headers are not a second Host.
         public = is_public_path(method, path)
         navigation = (method in ("GET", "HEAD") and path == "/"
                       and headers.get("sec-fetch-mode", [""])[0] == "navigate"
                       and headers.get("sec-fetch-dest", [""])[0] == "document")
         origins = headers.get("origin", [])
-        if origins and (len(origins) != 1 or origins[0].lower() != f"http://{host_header}"):
+        if origins and (len(origins) != 1
+                        or not origin_permitted(origins[0], host_header)):
             if not navigation:
                 return await deny(403, "cross_origin", "Cross-origin requests are refused.")
         site = headers.get("sec-fetch-site", [])

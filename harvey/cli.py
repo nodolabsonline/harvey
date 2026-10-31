@@ -991,7 +991,8 @@ def main():
     sub = subparsers.add_parser("dashboard", help="Open the web dashboard")
     sub.add_argument("--host", default="127.0.0.1",
                      help="Loopback address to listen on (default: 127.0.0.1; "
-                          "other addresses are refused)")
+                          "other addresses are refused). HARVEY_DASHBOARD_BIND "
+                          "overrides this when set")
     sub.add_argument("--port", type=int, default=5555, help="Port (default: 5555)")
     sub.add_argument("--url", action="store_true",
                      help="Print the unlock link (with its token) and exit")

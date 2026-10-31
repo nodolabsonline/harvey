@@ -1,4 +1,9 @@
-"""Harvey Dashboard — local web UI to set up, control, and monitor Harvey."""
+"""Harvey Dashboard — local web UI to set up, control, and monitor Harvey.
+
+Listens on loopback unless HARVEY_DASHBOARD_BIND is set. Extra Host names and
+https origins come from HARVEY_DASHBOARD_ALLOWED_HOSTS and
+HARVEY_DASHBOARD_ALLOWED_ORIGINS. See dashboard_auth.
+"""
 
 import asyncio
 import ipaddress
@@ -17,7 +22,7 @@ from pathlib import Path
 
 import aiosqlite
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse, JSONResponse, PlainTextResponse, Response,
@@ -2537,17 +2542,66 @@ class DashboardSetupError(Exception):
     """The dashboard can't start safely; the message says what to do."""
 
 
-def _check_loopback_bind(host: str) -> str:
-    """The host to bind, which must be a loopback address. The dashboard has
-    no remote-access mode: from another machine, use an SSH tunnel."""
+_PROXY_ENV_KEYS = (auth.BIND_ENV, auth.ALLOWED_HOSTS_ENV, auth.ALLOWED_ORIGINS_ENV)
+
+
+def _hydrate_dashboard_env():
+    """Fill unset proxy variables from .env. The process environment wins.
+
+    Only these three keys are copied, and a symlinked .env is left alone.
+    """
+    if not ENV_FILE.is_file() or ENV_FILE.is_symlink():
+        auth.set_proxy_file_values({})
+        return
+    parsed = dotenv_values(ENV_FILE)
+    auth.set_proxy_file_values({name: parsed.get(name) or "" for name in _PROXY_ENV_KEYS})
+
+
+def _normalize_bind(host: str) -> str:
     name = (host or "").strip().lower()
     if name.startswith("[") and name.endswith("]"):
         name = name[1:-1]
-    if not auth.is_loopback(name):
+    return name
+
+
+def _bindable_ip(name: str) -> bool:
+    if not name or "%" in name:
+        return False
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return not ip.is_multicast
+
+
+def _listen_host(requested: str) -> str:
+    """The address uvicorn should bind.
+
+    With no HARVEY_DASHBOARD_BIND, this is the loopback-only check the CLI
+    has always applied. A non-loopback address requires that variable and a
+    non-empty host allow-list.
+    """
+    problem = auth.exposure_error()
+    if problem:
+        raise DashboardSetupError(problem)
+    override = auth.proxy_setting(auth.BIND_ENV)
+    chosen = override if override else requested
+    name = _normalize_bind(chosen)
+    if auth.is_loopback(name):
+        return name
+    if not override:
         raise DashboardSetupError(
-            f"Refusing to listen on {host!r}: the dashboard only listens on this machine "
+            f"Refusing to listen on {requested!r}: the dashboard only listens on this machine "
             "(127.0.0.1, ::1 or localhost). To reach it from elsewhere, tunnel instead: "
             "ssh -L 5555:127.0.0.1:5555 <this-host>")
+    if not _bindable_ip(name):
+        raise DashboardSetupError(
+            f"Refusing to listen on {chosen!r}: {auth.BIND_ENV} must be an IP address "
+            "such as 127.0.0.1 or 0.0.0.0.")
+    if not auth.allowed_hosts():
+        raise DashboardSetupError(
+            f"Refusing to listen on {chosen!r}: set {auth.ALLOWED_HOSTS_ENV} to the "
+            "hostname the proxy sends in Host. '*' is not accepted.")
     return name
 
 
@@ -2555,21 +2609,30 @@ def dashboard_url(host: str = "127.0.0.1", port: int = 5555) -> str:
     """The unlock link. The token rides in the #fragment, which browsers
     never send to the server (so it stays out of logs and Referer); the
     page moves it to sessionStorage and strips it from the address bar."""
-    name = _check_loopback_bind(host)
+    _hydrate_dashboard_env()
+    name = _listen_host(host)
+    token = token_store.get()
+    if not auth.is_loopback(name):
+        origins = auth.allowed_origins()
+        if origins:
+            return f"{origins[0]}/#token={token}"
+        return f"http://127.0.0.1:{port}/#token={token}"
     try:
         if ipaddress.ip_address(name).version == 6:
             name = f"[{name}]"
     except ValueError:
         pass
-    return f"http://{name}:{port}/#token={token_store.get()}"
+    return f"http://{name}:{port}/#token={token}"
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
-    """Start the dashboard server (loopback only, token required)."""
+    """Start the dashboard server. Loopback unless HARVEY_DASHBOARD_BIND is
+    set; the API still requires the bearer token."""
     import uvicorn
 
     try:
-        bind = _check_loopback_bind(host)
+        _hydrate_dashboard_env()
+        bind = _listen_host(host)
         url = dashboard_url(host, port)
     except (DashboardSetupError, auth.TokenError) as e:
         raise DashboardSetupError(str(e)) from e
@@ -2580,5 +2643,7 @@ def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     if os.name == "nt":
         print("  Windows: the token file is protected by your folder's permissions,")
         print("  not POSIX file modes.\n")
+    # proxy_headers stays off. Traefik forwards the browser Host and Origin;
+    # X-Forwarded-* is not a second allow-list.
     uvicorn.run(app, host=bind, port=port, log_level="warning",
                 proxy_headers=False, server_header=False, date_header=False)
